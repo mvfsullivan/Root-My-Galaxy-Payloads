@@ -1,68 +1,95 @@
-# SM-S928W Porting Progress
+# SM-S928W Porting Progress — Final Report for Dev Review
 
 **Device:** Samsung Galaxy S24 Ultra (Canadian variant, SM-S928W)
 **Firmware:** BP4A.251205.006.S928WVLS6DZF2 (June 2026 security patch)
 **Kernel:** 6.1.145-android14-11-33419968-abS928USQS6DZF2
-**Date:** 2026-07-31
+**Date:** 2026-08-01
 
-## Summary
+## Executive Summary
 
-Kernel binary confirmed byte-identical to existing e3q-S928USQS6DZF2 profile (BTF SHA-256 matches). All 20 symbol offsets, BTF struct layouts, and 256/256 P0 fingerprint qwords verified. Through parameter tuning, achieved the FIRST successful gate reclaim on S24 Ultra hardware.
+Kernel binary confirmed byte-identical to e3q-S928USQS6DZF2 profile. All offsets verified. Through parameter tuning, achieved the FIRST and SECOND documented gate reclaims on S24 Ultra hardware. The probe pselect race remains the unsolved bottleneck — it requires a sub-microsecond timing window that no delay value we've tested can hit.
 
-## Verification Results
+## What Worked
 
-- 20/20 symbol offsets: MATCH
-- All BTF struct layouts: MATCH
-- P0 fingerprint table: 256/256 qwords MATCH
-- BTF SHA-256: 8415104c...d65efe56 (identical to case study)
-- SLIDE_TRACEFS_EVENT_ID: 106 (confirmed via ADB)
-- SLIDE_TRACEFS_WORKER_CALLER_OFF: 0x000db1a0 (confirmed via disassembly)
+### 1. SLIDE_KERNEL_PAGE_SETUP_ATTEMPTS=16 (was 2)
+The mm_struct leak is probabilistic. With the original value of 2, it almost never succeeded. With 16, it succeeds on retry 3-9, reliably reaching the pselect gate phase. This is a critical fix for app-mode payloads.
 
-## Tuning History
+### 2. Gate reclaim achieved (twice)
+- Run 1 (APK, tuned2): attempt 1, delay=25000, object_index=4, pipe=24, gate hits=1
+- Run 2 (local shell, 64 attempts): attempt 39, delay=45000, object_index=20, pipe=60, gate hits=1
 
-### Baseline (original parameters)
-- SLIDE_KERNEL_PAGE_SETUP_ATTEMPTS=2, no SLIDE_PHYSICAL_SLOT_DELAYS_USEC
-- Result: All 24 attempts failed at pipe page leak or mm_struct leak
-- Best: attempt 7 got pipe oracle prepared, phone rebooted during P0 oracle phase
+Both achieved gate hits=1, changed=0 — the exact success condition. This is further than any documented attempt on S24 Ultra.
 
-### Tuning 1: verbose=1 logging
-- Enabled KernelSnitch verbose output in util.c
-- Result: Identified three failure modes (pipe page leak, mm_struct leak, gate miss)
-- Best: attempt 2 got mm_struct leak + kernel page, but gate reclaim missed (hits=0)
+### 3. Shell context reduces reboots
+Running from `adb shell` (uid=2000, u:r:shell:s0, Seccomp=0) instead of the APK (uid=10429, u:r:untrusted_app:s0, Seccomp=2) eliminated reboots in one 64-attempt run. However, reboots still occur intermittently — shell context helps but doesn't guarantee stability.
 
-### Tuning 2: SLIDE_KERNEL_PAGE_SETUP_ATTEMPTS 2->8
-- Result: attempt 23 achieved mm_struct leak on retry 3, kernel page prepared
-- pselect race ran (ret=0, timing miss on probe)
-- No reboot, all 24 attempts completed
+### 4. object_index correlation
+- object_index=4: gate hit (run 1)
+- object_index=20: gate hit (run 2)
+- object_index=0: gate reclaim miss even when pselect ret=2
+- object_index=16,24: various results
 
-### Tuning 3: SLIDE_KERNEL_PAGE_SETUP_ATTEMPTS 8->16
-- Result: attempt 1 achieved mm_struct leak on FIRST try, kernel page prepared
-- pselect gate race SUCCEEDED (ret=2, ok=1)
-- GATE RECLAIM SUCCEEDED (hits=1, changed=0) -- FIRST TIME ON S24 ULTRA
-- Probe pselect race failed (ret=0, timing miss)
-- Exploit aborted after 1 attempt (oracle dirtied, refusing unsafe retry)
+This suggests the page layout affects whether the physical write lands in the correct pipe buffer.
 
-### Tuning 4: SLIDE_PHYSICAL_SLOT_DELAYS_USEC (current)
-- Added 8 delay values: 20000, 25000, 30000, 15000, 35000, 40000, 10000, 45000
-- Result: Phone rebooted during attempt 2 bruteforce (probabilistic crash)
-- Needs retry -- the crash happened before reaching the probe phase
+## What Didn't Work
 
-## Key Findings
+### 1. SLIDE_PHYSICAL_SLOT_DELAYS_USEC (probe multi-delay)
+Tested 8 delay values (20000-45000 and 45000-60000). When the gate succeeds and the probe tries all 8 delays, ALL return ret=0. The probe pselect race never hits the timing window regardless of delay.
 
-1. SLIDE_KERNEL_PAGE_SETUP_ATTEMPTS=16 is critical -- the mm_struct leak is probabilistic and needs multiple retries
-2. The gate pselect race works with delay=25000 (ret=2, gate hits=1)
-3. The probe pselect race needs a DIFFERENT delay than the gate (ret=0 with same delay)
-4. SLIDE_PHYSICAL_SLOT_DELAYS_USEC gives the probe multiple delay attempts
-5. Phone reboots are probabilistic -- the KernelSnitch bruteforce touches physical memory
+Key observation: the gate succeeds with ret=2, but the probe with the same delay returns ret=0. The probe writes to a different physical offset (P0_ORACLE_PROBE_OFFSET=0x1f0000 vs gate's 0x0e80) — the timing window is different and none of our delays hit it.
 
-## Current Build Parameters
+### 2. PSELECT_ENTER_DELAY_USEC variations
+Tested delays from 10000 to 60000 across many runs. The gate race succeeds ~3% per attempt. The probe race succeeds 0% across all runs.
 
-- src/common.h (APP_PAYLOAD): SLIDE_KERNEL_PAGE_SETUP_ATTEMPTS=16, FOPS_KERNEL_PAGE_SETUP_ATTEMPTS=16
-- src/targets/e3q-S928USQS6DZF2/target.h: SLIDE_PHYSICAL_SLOT_DELAYS_USEC with 8 delays
+## The Core Problem
+
+The pselect race works by:
+1. Consumer thread calls sched_setattr() to change the waiter's scheduling
+2. Waiter thread is in pselect6() syscall
+3. The sched_setattr must fire during the microsecond window when pselect copies fd_sets to the stack
+4. The fake waiter (on the stack) gets overwritten with our controlled data
+
+For the GATE: this works ~3% of the time — the timing window exists and is hittable.
+For the PROBE: the timing window appears to not exist or is much narrower. All 8 delays return ret=0 (pselect returns 0 ready fds — the race never triggers).
+
+This suggests the probe's physical page layout or scheduling path is fundamentally different from the gate's, and the current timing approach cannot hit it.
+
+## Data for the Dev
+
+### Gate hit logs (2 occurrences)
+Both show: pselect ret=2, sched_ok=1, gate hits=1, changed=0
+Full verbose logs available in the offline-testing-e3q branch.
+
+### Probe failure logs (all attempts)
+All show: pselect ret=0, sched_ok=1 (sched_setattr succeeds but race doesn't trigger)
+The consumer thread fires correctly (sched_ok=1) but the pselect doesn't observe the fd state change.
+
+### object_index data
+- Gate success: index=4, index=20
+- Gate miss with ret=2: index=16
+- Gate miss with ret=0: various
+
+## Current Build Configuration
+
+- src/common.h: SLIDE_KERNEL_PAGE_SETUP_ATTEMPTS=16, FOPS_KERNEL_PAGE_SETUP_ATTEMPTS=16
+- src/targets/e3q-S928USQS6DZF2/target.h: SLIDE_PHYSICAL_SLOT_DELAYS_USEC with 8 delays (45000-centered)
 - src/util.c: kernelsnitch_setup verbose=1
+- Branch: offline-testing-e3q
 
-## Next Steps
+## Questions for the Dev
 
-1. Retry the exploit (probabilistic -- may succeed on next run without crash)
-2. If probe still fails after multi-delay, try narrowing delays near 25000
-3. Consider increasing EXPLOIT_ATTEMPTS beyond 24 if bruteforce crash rate is high
+1. Why does the probe pselect race consistently return ret=0 while the gate race can return ret=2? Is the timing window fundamentally different for P0_ORACLE_PROBE_SLOT vs P0_ORACLE_GATE_SLOT?
+
+2. Could P0_ORACLE_PROBE_OFFSET (0x1f0000) be wrong for this kernel? The gate offset (0x0e80) works — is there a way to verify the probe offset?
+
+3. Is there a diagnostic mode (like P0_ORACLE_GATE_DIAG) that can test the probe without proceeding to slide detection?
+
+4. Could the CONSUMER_MAX_CALLS=1 limitation be the issue? The consumer fires sched_setattr once per child — would multiple calls per child help?
+
+5. The object_index correlation (0 = miss, 4/20 = hit) — is this meaningful? Does the slab position affect the physical page alignment?
+
+## Repository
+
+- Fork: github.com/mvfsullivan/Root-My-Galaxy-Payloads
+- Branch: offline-testing-e3q
+- All verbose logs and tuning history committed
